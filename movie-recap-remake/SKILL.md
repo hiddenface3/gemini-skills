@@ -251,32 +251,29 @@ Save to: `03_transcripts_and_cuttables/synced_cut_table.txt`
 
 ---
 
-### Phase 7 — Render Final Synced Video
+### Phase 7 — Render Final Synced Video (Direct Cut, Stitch, and Mux)
 
-Run `render_synced_video.mjs` to:
-1. Parse `synced_cut_table.txt`
-2. Cut each clip from `source_video.mp4` — **strip audio at cut time using `-an`** so source audio never bleeds into final video
-3. Concatenate all silent clips into `05_intermediate_clips/synced_video_noaudio.mp4`
-4. Mux with `combined_voiceover.wav` → `06_final_exports/final_movie_recap_synced.mp4`
+> ⛔ **ABSOLUTE RULE**: Do NOT invent fixes, modify timestamps, scale durations, or do things from your own side. Strictly cut the exact clips Gemini gave in the table from the 1080p source video, combine them together into one continuous silent video, and place the generated voiceover on top. If there are any errors or sync issues, the user will fix them themselves.
 
+Run `render_synced_video.mjs`:
+1. Read `synced_cut_table.txt` exactly as provided.
+2. Cut each clip from `01_source_video/source_video.mp4` using `-an` to remove original source audio:
 ```bash
-node 04_scripts/render_synced_video.mjs
-```
-
-Key ffmpeg clip cut command — **`-an` removes audio at cut time**:
-```bash
-ffmpeg -y -ss <start> -t <duration> -i "source_video.mp4" \
+ffmpeg -y -ss <start> -t <duration> -i "01_source_video/source_video.mp4" \
   -an -c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p \
-  -r 30000/1001 "clip_XX.mp4"
+  "clip_XX.mp4"
 ```
-
-> 🔇 The `-an` flag strips audio from every clip as it is cut. This ensures the source video's original audio (dialogue, background sound) never interferes with the generated voiceover.
-
-Final mux command:
+3. Concatenate all cut clips together into one continuous video file with no audio:
 ```bash
-ffmpeg -y -i synced_video_noaudio.mp4 -i combined_voiceover.wav \
-  -c:v copy -c:a aac -b:a 192k -shortest final_movie_recap_synced.mp4
+ffmpeg -y -f concat -safe 0 -i concat_list.txt -c copy "05_intermediate_clips/synced_video_noaudio.mp4"
 ```
+4. Directly combine that video file with the generated voiceover audio (`02_audio_voiceover/combined_voiceover.wav`):
+```bash
+ffmpeg -y -i "05_intermediate_clips/synced_video_noaudio.mp4" -i "02_audio_voiceover/combined_voiceover.wav" \
+  -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k "06_final_exports/final_movie_recap_synced.mp4"
+```
+No re-scaling, no timestamp tweaking, no extra logic. Just cut, concatenate, and mux.
+
 
 ---
 
@@ -317,14 +314,15 @@ At the end of each project, verify:
 
 ## Important Technical Notes
 
-1. **360p proxy MUST keep audio** — Gemini needs both visuals and dialogue/audio to understand the full story and write an accurate recap script. Do NOT strip audio from the proxy.
-2. **Source audio stripped ONLY at cut time** — when cutting clips in Phase 7, use `-an` flag in ffmpeg. Never pre-strip audio from the source video as a separate step.
-3. **Raw TTS output is headerless PCM** — always run through ffmpeg with `-f s16le -ar 24000 -ac 1` to add proper WAV header before transcription or playback.
-4. **Clip duration sum must equal audio duration** — no gaps or black frames. If audio has a pause segment, still cut a visual clip to fill it.
-5. **Each project is a separate folder** — never mix files from different projects. Prefix folder: `project_NN_<short_name>/`
-6. **Proxy for AI only** — Gemini analyzes 360p proxy WITH audio. All final video cutting uses 1080p source.
-7. **User always approves** the script before TTS generation. Present the full narration paragraph and wait for confirmation.
-8. **User always approves** the cut table before rendering. Show the full table and wait for confirmation.
+1. **NEVER DO STUFF FROM YOUR OWN SIDE**: Follow the skill steps exactly as written. Do not add clever fixes, re-time clips, change speed, or modify audio/video files unless explicitly instructed by the user. If an error happens, the user will handle it.
+2. **360p proxy MUST keep audio** — Gemini needs both visuals and dialogue/audio to understand the full story and write an accurate recap script. Do NOT strip audio from the proxy.
+3. **Source audio stripped ONLY at cut time** — when cutting clips from the 1080p source, use `-an` flag in ffmpeg. Never pre-strip audio from the main source video file.
+4. **Pure Cut + Concat + Mux** — When the cut table is generated, cut the clips, stitch them into one continuous silent video, and place the voiceover WAV on top. Do not add padding, do not loop clips, do not adjust audio pitch/speed.
+5. **Raw TTS output is headerless PCM** — always run through ffmpeg with `-f s16le -ar 24000 -ac 1` to add proper WAV header before transcription or playback.
+6. **Each project is a separate folder** — never mix files from different projects. Prefix folder: `project_NN_<short_name>/`
+7. **Proxy for AI only** — Gemini analyzes 360p proxy WITH audio. All final video cutting uses 1080p source.
+8. **User always approves** the script before TTS generation. Present the full narration paragraph and wait for confirmation.
+9. **User always approves** the cut table before rendering. Show the full table and wait for confirmation.
 
 ---
 
