@@ -153,6 +153,76 @@ Run `build_timeline.py` to match the exact spoken sentence durations:
    - `Source start`: `src_start` anchored to the matching source transcript moment.
    - Slicing will take `v_end - v_start` seconds starting at `src_start` from the 1080p source video.
 
+Complete reference `build_timeline.py`:
+```python
+import json, re
+from difflib import SequenceMatcher
+from pathlib import Path
+
+root = Path(".")
+data = json.loads((root / "03_transcripts_and_cuttables/word_transcript.json").read_text())
+provided = []
+for line in (root / "03_transcripts_and_cuttables/provided_cut_table.txt").read_text().splitlines()[1:]:
+    if not line.strip():
+        continue
+    sentence, source, description = line.split(" | ", 2)
+    provided.append((sentence.strip(), source.strip(), description.strip()))
+sentences = [sentence for sentence, _, _ in provided]
+
+def normalize(value):
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+words = data["words"]
+(root / "03_transcripts_and_cuttables/word_transcript.txt").write_text(
+    "\n".join(f"{w['start']:.3f} - {w['end']:.3f}: {w['word']}" for w in words) + "\n"
+)
+
+starts, position = [], 0
+for s_idx, sentence in enumerate(sentences):
+    target = [normalize(x) for x in re.findall(r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)?", sentence)]
+    found, best_score = None, 0.0
+    for index in range(position, len(words)):
+        score = 0.0
+        for offset, token in enumerate(target[:4]):
+            if index + offset >= len(words):
+                break
+            candidate = normalize(words[index + offset]["word"])
+            score += max(SequenceMatcher(None, candidate, token).ratio(), 1.0 if candidate == token else 0.0)
+        score /= min(4, len(target))
+        if score > best_score:
+            best_score, found = score, index
+    if best_score < 0.55:
+        found = None
+    if found is None:
+        raise SystemExit(f"Could not locate sentence {s_idx + 1}: {sentence}")
+    starts.append(found)
+    position = found + 1
+
+timings = []
+for index, start_index in enumerate(starts):
+    end_index = starts[index + 1] if index + 1 < len(starts) else len(words)
+    timings.append((float(words[start_index]["start"]), float(words[end_index - 1]["end"])))
+
+(root / "03_transcripts_and_cuttables/transcript_with_timestamps.txt").write_text(
+    "\n".join(f"{i:02d}. [{s:.3f} - {e:.3f}] {sent}" for i, ((s, e), sent) in enumerate(zip(timings, sentences), 1)) + "\n"
+)
+
+total_duration = float(data["duration"])
+lines = ["# | Script line | Visual timeline | Audio range | Provided Video Range | Visual description"]
+for index, ((sentence, source, description), (a_start, a_end)) in enumerate(zip(provided, timings)):
+    v_start = 0.0 if index == 0 else timings[index][0]
+    v_end = timings[index + 1][0] if index + 1 < len(timings) else total_duration
+    lines.append(
+        f"{index + 1} | {sentence} | "
+        f"[{v_start // 60:02.0f}:{v_start % 60:06.3f} – {v_end // 60:02.0f}:{v_end % 60:06.3f}] | "
+        f"[{a_start // 60:02.0f}:{a_start % 60:06.3f} – {a_end // 60:02.0f}:{a_end % 60:06.3f}] | "
+        f"{source} | {description}"
+    )
+
+(root / "03_transcripts_and_cuttables/synced_cut_table.txt").write_text("\n".join(lines) + "\n")
+print(f"SUCCESS: synced {len(sentences)} sentences, total audio duration {total_duration:.3f}s")
+```
+
 ### Phase 6: Download 1080p Source Video
 
 Download the full video at 1080p:
@@ -162,49 +232,157 @@ yt-dlp -f "137+140-1/137+140-0/137+140/bestvideo[height<=1080]+bestaudio/best[he
   -o "01_source_video/source_video.mp4" "<YOUTUBE_URL>"
 ```
 
-### Phase 7: Cut Silent Clips and Concat Stitch
+### Phase 7: Cut Silent Clips, Stitch, and Export Complete Package
 
-Execute `render_recap.py`:
-1. Slices silent clips with `h264_nvenc` using `nice -n 10` and scale/pad into 1920x1080.
-2. Concatenates all clips via `-f concat -safe 0 -i concat.txt -c copy` into `stitched_silent.mp4`.
+Create and run `render_recap.py` to automate clip rendering, stitching, muxing, vertical formatting, and music mixing:
 
-### Phase 8: Mux Voiceover
+```python
+import re, subprocess
+from pathlib import Path
 
-```bash
-ffmpeg -y -i "04_video_clips/stitched_silent.mp4" \
-  -i "02_audio_voiceover/combined_voiceover.wav" \
-  -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k \
-  -shortest -movflags +faststart \
-  "06_final_exports/raw_synced.mp4"
+root = Path(".")
+source = root / "01_source_video/source_video.mp4"
+table = root / "03_transcripts_and_cuttables/synced_cut_table.txt"
+audio = root / "02_audio_voiceover/combined_voiceover.wav"
+music = Path("/media/huzaifa/06CC0A9BCC0A8561/mcp with antigravity/Subsurface Pulse (1).mp3")
+clips = root / "04_video_clips"
+exports = root / "06_final_exports"
+clips.mkdir(exist_ok=True)
+exports.mkdir(exist_ok=True)
+
+def parse_time(val):
+    val = val.strip()
+    m, s = val.split(":")
+    return int(m) * 60 + float(s)
+
+def run(cmd):
+    print("Running:", " ".join(cmd))
+    subprocess.run(cmd, check=True)
+
+def get_duration(fpath):
+    res = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(fpath)],
+        capture_output=True, text=True, check=True
+    )
+    return float(res.stdout.strip())
+
+# Read cut table rows
+rows = []
+for line in table.read_text().splitlines()[1:]:
+    if not line.strip():
+        continue
+    parts = line.split(" | ")
+    v_match = re.search(r"\[(\d{2}:\d{2}\.\d{3})\s*–\s*(\d{2}:\d{2}\.\d{3})\]", parts[2])
+    if not v_match:
+        raise ValueError(f"Could not parse visual range in line: {line}")
+    v_start = parse_time(v_match.group(1))
+    v_end = parse_time(v_match.group(2))
+    
+    src_parts = parts[4].split(" – ")
+    src_start = parse_time(src_parts[0])
+    
+    rows.append({
+        "index": int(parts[0]),
+        "v_start": v_start,
+        "v_end": v_end,
+        "v_dur": v_end - v_start,
+        "src_start": src_start,
+        "desc": parts[5]
+    })
+
+print(f"Parsed {len(rows)} rows.")
+
+# Render silent clips
+manifest_lines = []
+for r in rows:
+    clip_path = clips / f"clip_{r['index']:02d}.mp4"
+    run([
+        "nice", "-n", "10", "ffmpeg", "-y",
+        "-ss", f"{r['src_start']:.3f}",
+        "-i", str(source),
+        "-t", f"{r['v_dur']:.3f}",
+        "-an",
+        "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black",
+        "-c:v", "h264_nvenc", "-preset", "p2", "-rc", "vbr", "-cq", "23", "-b:v", "0",
+        "-filter_threads", "1", "-filter_complex_threads", "1", "-threads", "2",
+        "-pix_fmt", "yuv420p",
+        str(clip_path)
+    ])
+    manifest_lines.append(f"file '{clip_path.resolve()}'\n")
+
+manifest = clips / "concat.txt"
+manifest.write_text("".join(manifest_lines))
+
+# Stitch silent
+silent = clips / "stitched_silent.mp4"
+run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(manifest), "-c", "copy", str(silent)])
+
+# Mux narration
+raw_sync = exports / "raw_synced.mp4"
+run([
+    "ffmpeg", "-y",
+    "-i", str(silent),
+    "-i", str(audio),
+    "-map", "0:v:0", "-map", "1:a:0",
+    "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+    "-shortest", "-movflags", "+faststart",
+    str(raw_sync)
+])
+
+# Create TikTok vertical raw
+raw_tiktok = exports / "raw_tiktok.mp4"
+run([
+    "nice", "-n", "10", "ffmpeg", "-y",
+    "-i", str(raw_sync),
+    "-vf", "crop=ih*1080/1152:ih:(iw-ih*1080/1152)/2:0,scale=1080:1152,pad=1080:1920:0:384:black",
+    "-c:v", "h264_nvenc", "-preset", "p2", "-rc", "vbr", "-cq", "23", "-b:v", "0",
+    "-filter_threads", "1", "-filter_complex_threads", "1", "-threads", "2",
+    "-c:a", "copy", "-movflags", "+faststart",
+    str(raw_tiktok)
+])
+
+# Blend background music into landscape
+final_landscape = exports / "final_movie_recap_synced.mp4"
+dur_landscape = get_duration(raw_sync)
+fade_start_l = max(0.0, dur_landscape - 2.0)
+run([
+    "nice", "-n", "10", "ffmpeg", "-y",
+    "-stream_loop", "-1", "-i", str(music),
+    "-i", str(raw_sync),
+    "-filter_complex",
+    f"[0:a]volume=0.316,afade=t=out:st={fade_start_l:.3f}:d=2[music];[1:a][music]amix=inputs=2:duration=first:dropout_transition=2[a]",
+    "-map", "1:v:0", "-map", "[a]",
+    "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+    "-shortest", "-movflags", "+faststart",
+    str(final_landscape)
+])
+
+# Blend background music into TikTok vertical
+final_tiktok = exports / "final_movie_recap_tiktok_vertical.mp4"
+dur_tiktok = get_duration(raw_tiktok)
+fade_start_t = max(0.0, dur_tiktok - 2.0)
+run([
+    "nice", "-n", "10", "ffmpeg", "-y",
+    "-stream_loop", "-1", "-i", str(music),
+    "-i", str(raw_tiktok),
+    "-filter_complex",
+    f"[0:a]volume=0.316,afade=t=out:st={fade_start_t:.3f}:d=2[music];[1:a][music]amix=inputs=2:duration=first:dropout_transition=2[a]",
+    "-map", "1:v:0", "-map", "[a]",
+    "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+    "-shortest", "-movflags", "+faststart",
+    str(final_tiktok)
+])
+
+# Cleanup raw intermediates
+if raw_sync.exists():
+    raw_sync.unlink()
+if raw_tiktok.exists():
+    raw_tiktok.unlink()
+
+print("ALL PHASES COMPLETE:")
+print("Landscape:", final_landscape)
+print("TikTok Vertical:", final_tiktok)
 ```
-
-### Phase 9: Export 9:16 TikTok Vertical
-
-Transform 16:9 into 9:16 (1080x1920) with 384px black bands top and bottom (middle 1152px occupied by the active image):
-```bash
-nice -n 10 ffmpeg -y -i "06_final_exports/raw_synced.mp4" \
-  -vf "crop=ih*1080/1152:ih:(iw-ih*1080/1152)/2:0,scale=1080:1152,pad=1080:1920:0:384:black" \
-  -c:v h264_nvenc -preset p2 -rc vbr -cq 23 -b:v 0 \
-  -filter_threads 1 -filter_complex_threads 1 -threads 2 \
-  -c:a copy -movflags +faststart \
-  "06_final_exports/raw_tiktok.mp4"
-```
-
-### Phase 10: Blend Background Music
-
-Music track: `/media/huzaifa/06CC0A9BCC0A8561/mcp with antigravity/Subsurface Pulse (1).mp3`
-Mix music at `0.316` volume (~ -10 dB), loop, fade out over the final 2 seconds, and combine with the voiceover stream via `amix`:
-```bash
-nice -n 10 ffmpeg -y \
-  -stream_loop -1 -i "/media/huzaifa/06CC0A9BCC0A8561/mcp with antigravity/Subsurface Pulse (1).mp3" \
-  -i "06_final_exports/raw_synced.mp4" \
-  -filter_complex "[0:a]volume=0.316,afade=t=out:st=$(ffprobe -v error -show_entries format=duration -of csv=p=0 '06_final_exports/raw_synced.mp4')-2:d=2[music];[1:a][music]amix=inputs=2:duration=first:dropout_transition=2[a]" \
-  -map 1:v:0 -map "[a]" -c:v copy -c:a aac -b:a 192k \
-  -shortest -movflags +faststart \
-  "06_final_exports/final_movie_recap_synced.mp4"
-```
-Apply identical mix to the vertical export:
-`06_final_exports/final_movie_recap_tiktok_vertical.mp4`
 
 ---
 
